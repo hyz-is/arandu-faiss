@@ -28,8 +28,10 @@ import (
 // a Model only after a Grant. This package has no Service and no Model: it
 // reads no table and serves no route, and the capability audit below is what
 // says so -- it fails the day a table or a socket appears without the manifest
-// saying so. What it keeps from the skeleton is the tenant rule: nothing here
-// reads a tenant out of a request.
+// saying so. What it keeps from the skeleton is the tenant rule, because it
+// does keep tenant data -- one index per tenant: nothing here reads a tenant
+// out of a request, and every index is reached with a Grant whose
+// data.Tenant names it.
 //
 // What these tests do not reach is worth as much as what they do. They read
 // syntax: a call hidden behind an interface and anything reached by reflection
@@ -374,4 +376,124 @@ func TestTheAuditReadsBothBuilds(t *testing.T) {
 			t.Errorf("the audit does not read %s", path)
 		}
 	}
+}
+
+// TestTheTenantComesOnlyFromTheGrant holds the multi-tenant rule where this
+// package keeps tenant data: every exported Registry method takes the
+// security.Grant the application's policy issued and no tenant of its own, and
+// every Key the package builds takes its Tenant from data.Tenant -- directly,
+// or through a variable assigned from it and from nothing else.
+func TestTheTenantComesOnlyFromTheGrant(t *testing.T) {
+	t.Parallel()
+
+	methods, keys := 0, 0
+	for _, source := range auditedFiles(t) {
+		for _, declaration := range source.file.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if !ok || function.Body == nil {
+				continue
+			}
+			if receiverType(function) == "Registry" && function.Name.IsExported() && takesAContext(function) {
+				methods++
+				if !takesAGrant(function) {
+					t.Errorf("%s: Registry.%s takes no security.Grant, so nothing says whose index it reaches",
+						source.path, function.Name.Name)
+				}
+				for _, field := range function.Type.Params.List {
+					for _, name := range field.Names {
+						if strings.Contains(strings.ToLower(name.Name), "tenant") {
+							t.Errorf("%s: Registry.%s takes a parameter %s; the tenant comes from the Grant",
+								source.path, function.Name.Name, name.Name)
+						}
+					}
+				}
+			}
+
+			fromGrant := map[string]bool{}
+			assigned := map[string]int{}
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				assignment, ok := node.(*ast.AssignStmt)
+				if !ok {
+					return true
+				}
+				for i, target := range assignment.Lhs {
+					name, ok := target.(*ast.Ident)
+					if !ok || i >= len(assignment.Rhs) {
+						continue
+					}
+					assigned[name.Name]++
+					if isTenantCall(assignment.Rhs[i]) {
+						fromGrant[name.Name] = true
+					}
+				}
+				return true
+			})
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				literal, ok := node.(*ast.CompositeLit)
+				if !ok || namedType(literal.Type) != "Key" {
+					return true
+				}
+				for _, element := range literal.Elts {
+					pair, ok := element.(*ast.KeyValueExpr)
+					if !ok || selectorName(pair.Key) != "Tenant" {
+						continue
+					}
+					keys++
+					if isTenantCall(pair.Value) {
+						continue
+					}
+					if name, ok := pair.Value.(*ast.Ident); ok && fromGrant[name.Name] && assigned[name.Name] == 1 {
+						continue
+					}
+					t.Errorf("%s: %s builds a Key whose Tenant is not data.Tenant of a Grant", source.path, function.Name.Name)
+				}
+				return true
+			})
+		}
+	}
+	if methods == 0 || keys == 0 {
+		t.Fatalf("found %d Registry methods and %d Keys, so this test proved nothing", methods, keys)
+	}
+}
+
+func takesAContext(function *ast.FuncDecl) bool {
+	params := function.Type.Params.List
+	return len(params) > 0 && selectorName(params[0].Type) == "Context"
+}
+
+func takesAGrant(function *ast.FuncDecl) bool {
+	for _, field := range function.Type.Params.List {
+		if selector, ok := field.Type.(*ast.SelectorExpr); ok && selector.Sel.Name == "Grant" {
+			if pkg, ok := selector.X.(*ast.Ident); ok && pkg.Name == "security" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isTenantCall reports whether the expression is a call to data.Tenant.
+func isTenantCall(expression ast.Expr) bool {
+	call, ok := expression.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || selector.Sel.Name != "Tenant" {
+		return false
+	}
+	pkg, ok := selector.X.(*ast.Ident)
+	return ok && pkg.Name == "data"
+}
+
+// selectorName is the trailing name of a selector, or the name of an
+// identifier.
+func selectorName(expression ast.Expr) string {
+	switch expression := expression.(type) {
+	case *ast.SelectorExpr:
+		return expression.Sel.Name
+	case *ast.Ident:
+		return expression.Name
+	}
+	return ""
 }

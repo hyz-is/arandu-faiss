@@ -40,7 +40,9 @@ var (
 	// system grant refused for having none. No index belongs to nobody.
 	ErrNoTenant = errors.New("faiss: the grant carries no tenant")
 	// ErrReadOnly is a write attempted with a read-only Grant, issued to a
-	// subject somebody else is viewing as.
+	// subject somebody else is viewing as. The error the registry returns
+	// wraps it together with hesape's own refusal, which is a forbidden, so
+	// an application's router answers it with 403.
 	ErrReadOnly = errors.New("faiss: the grant is read-only")
 	// ErrNotStored is what a Store answers Load with when it holds nothing
 	// under the key. The registry starts an empty index for it.
