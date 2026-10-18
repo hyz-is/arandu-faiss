@@ -10,6 +10,8 @@ a release is corrected by another release and never by moving a tag.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-18
+
 Proposed as `v0.1.0`, the first public release, as
 `github.com/hyz-is/arandu-faiss`. When it is tagged, this section moves under
 `## [0.1.0] - <date>` and `UPGRADE.md` gains `## v0.1.0`.
