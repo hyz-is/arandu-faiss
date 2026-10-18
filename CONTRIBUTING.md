@@ -4,60 +4,48 @@ Thank you for considering a contribution.
 
 ## Before you open a pull request
 
-Run the four gates. They are what CI runs, and a pull request that fails one of
+Run the gates. They are what CI runs, and a pull request that fails one of
 them fails for everybody who pulls after it.
 
 ```bash
+export GOWORK=off CGO_ENABLED=1
 gofmt -l $(find . -name '*.go' -not -path '*/testdata/*' -not -name '*.kyse.go')
 go build ./...
+CGO_ENABLED=0 go build ./...
 go vet ./...
-go test -race ./...
+go test -race -count=1 ./...
+CGO_ENABLED=0 go test -count=1 ./...
 ```
 
-The two filters on `gofmt` are not preference. `gofmt` is the only tool in the
-chain that ignores build tags, so it reads files the compiler deliberately
-excludes; `testdata/` holds fixtures that are invalid on purpose.
-
-A change to the entity in `model.go` is followed by `aru model:build`, which
-rewrites `FaissQuery.go`, and the regenerated file goes in the same commit.
-`aru model:build --check` exits 1 when the committed file is missing, stale or
-edited by hand.
+FAISS has to be installed with its C API for the cgo lines; the README says
+how on each system. The two filters on `gofmt` are not preference. `gofmt` is
+the only tool in the chain that ignores build tags, so it reads files the
+compiler deliberately excludes; `testdata/` holds fixtures that are invalid on
+purpose.
 
 ## What a change has to keep true
 
-Four properties are the reason this package is what it is. A change that breaks
+Five properties are the reason this package is what it is. A change that breaks
 one of them will not be merged, whatever else it improves.
 
-1. **The policy denies by default.** No branch allows every action, and none is
-   added. Opening an action means writing the rule that opens it.
-2. **Every Service method authorizes before reaching the Model.** The Grant is
-   then required by the Model terminal; constructing `Faisss(db)` first is
-   already the wrong order and the structural audit rejects it.
-3. **The tenant comes from `data.Tenant(g)`.** Not from the path, the body, the
-   query string or a header, on any code path, including the read paths.
-4. **`arandu.mod.toml` matches the code.** Adding an outbound call, a file
-   write or a process means declaring it there in the same commit.
+1. **Nothing here decides.** A search answers candidates and provenance; a
+   threshold, a verdict or a boolean in a result belongs to the application.
+2. **The tenant comes from `data.Tenant(g)`.** Every `Registry` method takes a
+   `security.Grant`, and no tenant arrives any other way.
+3. **The package names no file.** Indexes are bytes handed to the
+   application's `Store`.
+4. **A write is in the Store when it returns,** and a failed save is never
+   answered from.
+5. **`arandu.mod.toml` matches the code,** in the build with cgo and in the
+   one without.
 
-CRUD stays on `Faisss(db)` and its generated query. Add a Repository only for
-a specialized complex query, read model, report, export or raw SQL contract; a
-wrapper around `Find`, `Get`, `Save` or `Delete` is a second data path.
+A rule an index keeps is written once, in `index.go`, over the `engine*`
+functions; the two engine files only implement or refuse them. A new call into
+FAISS goes through `call`, which keeps the thread locked until FAISS's error is
+read.
 
-Every query starts at `Faisss(s.db)`. The constructor returns one mutable
-query, so a second chain begun from a value held in a variable carries the
-clauses of the first -- and that compiles.
-
-Model-backed entities stay pointers. A copy of `Faiss` keeps the model of the
-row it was copied from, and the model refuses to write through the copy with
-`model.ErrUnwired`. Response resources are the deliberate snapshot boundary;
-Service results are not.
-
-The rules of the entity itself go in the custom block of `model.go`, as pure
-methods. The Service orchestrates, and holds no rule the entity could hold.
-
-Handlers read who is asking with `ctx.User()`, which `RequireAuth` filled, and
-return the error the Service returned for the router to answer. A handler that
-loads the session or maps an error to a status fails
-`TestHandlersLeaveTheSubjectAndTheStatusToTheFramework`.
+Every vector in a test is synthetic, from a seeded generator. No real face,
+template or document is ever a fixture.
 
 ## Style
 

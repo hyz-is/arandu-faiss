@@ -15,16 +15,16 @@ names the situation you are in rather than the topic it covers.
 
 | skill | when it fires |
 | --- | --- |
-| `faiss-policy` | opening an action, adding an authorized Model-backed use case, or anything answering 403 |
-| `faiss-module` | adding a route, a handler, a config field, a response field or a migration |
-| `faiss-release` | the gates, the manifest, a dependency, a version, a tag |
+| `faiss-module` | changing the index, the registry, the store contract, the envelope, the binding, the configuration or the module |
+| `faiss-release` | the gates, cgo and FAISS, the manifest, a dependency, a version, a tag |
 | `faiss-vault-notes` | writing the note, the gap or the journal entry, when this checkout sits inside the Arandu Obsidian vault |
 | `faiss-package` | installing and wiring this package **into an application** |
 
 The last one has a different audience from the other three, and that is on
 purpose: it travels with the package so that an assistant working in somebody
-else's project — the one running `go get` — has the wiring, the migration step
-and the closed policy in front of it instead of guessing.
+else's project — the one running `go get` — has the build requirement, the
+wiring, the Store contract and the Grant rule in front of it instead of
+guessing.
 
 Its frontmatter says so, under `metadata`, with `audience: app`. That line is
 what `aru skills:sync` reads to copy the skill into an application whose
@@ -39,19 +39,12 @@ package cloned somewhere else never grows a folder tree imitating one.
 ## Why these exist
 
 The audience of the first three is somebody changing the package. The common
-failure modes are a provider, a container lookup, a hand edit to the generated
-`FaissQuery.go`, a rule of the entity written into the Service instead of the
-custom block of `model.go`, a handler that loads the session or maps an error to
-a status itself, a CRUD Repository beside the Model, a tenant read from the URL,
-or a Policy branch that returns nil for administrators "for now". None belongs
-here, and the last three are security failures rather than style disagreements.
-
-The package is built to be checked rather than trusted. Its denial tests use a
-nil database, so reaching even the generated query constructor before
-authorization panics. The structural twin reads every exported Service method
-and checks the same order on the allowed path, and reads every handler for the
-subject and the status it must leave to the framework. Running
-`go test -race ./...` exercises all of it.
+failure modes are a threshold that turns candidates into a decision, a tenant
+taken from a parameter instead of the Grant, an index written to a file path, a
+write that returns before its Save, a FAISS call whose error is read on another
+thread, and an IVF index removed from through IDMap2. None belongs here; the
+first two are how an engine's evidence stops being evidence and one tenant's
+faces reach another's search.
 
 ## Adding your own
 

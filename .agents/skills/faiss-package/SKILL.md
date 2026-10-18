@@ -1,6 +1,6 @@
 ---
 name: faiss-package
-description: Install, wire and use the Arandu FAISS package (Go, Arandu) in an application. Use when the request is to "install Arandu FAISS", "add faiss to the app", "go get github.com/hyz-is/arandu-faiss", "wire it into bootstrap/app.go", "register the module", "use the faiss routes", "everything under /faiss returns 403", "403 forbidden from faiss", "it redirects to /auth/login", "the table does not exist", "no such table", "change where it is mounted", "let admins read it", or when a project's go.mod already requires github.com/hyz-is/arandu-faiss. Covers the three lines of wiring and where each one goes, the Config fields, none of them required, the routes, their names and the session they need, why the policy refuses everything until somebody opens it, and the migration step that is not optional.
+description: Install, wire and use the Arandu FAISS package (Go, Arandu) in an application. Use when the request is to "install arandu-faiss", "add FAISS", "face duplicate detection", "1:N search", "search similar faces", "go get github.com/hyz-is/arandu-faiss", "wire it into bootstrap/app.go", "implement the Store", "save the index to R2", "the build fails with faiss/c_api/... not found", "library not loaded: libfaiss_c", "FAISS is not linked into this build", "ErrNoTenant", "ErrReadOnly", "ErrSpecMismatch", "unknown model", "erase a template", "rebuild the index", or when a project's go.mod already requires github.com/hyz-is/arandu-faiss. Covers the build requirement, the wiring and where it goes, the Config fields, the Grant every call takes, the Store contract, and what each error means.
 license: MIT
 metadata:
   audience: app
@@ -8,23 +8,34 @@ metadata:
 
 # Using Arandu FAISS
 
-An Arandu package with one entity, its own table, its own routes and its own
-policy. It is registered by hand — there is no service provider, no container
-and no discovery, so if a line is not written in the application, it does not
-happen.
+A module that keeps one FAISS index per tenant and embedding model and answers
+a query with the nearest stored vectors: ids, scores and the provenance of the
+search. It decides nothing — whether a candidate is the same person is the
+application's decision. It is registered by hand: there is no service
+provider, no container and no discovery.
+
+## Build requirement
+
+`CGO_ENABLED=1`, a C compiler, and FAISS built with its C API (`libfaiss_c`)
+on the machine that builds and the one that runs. macOS: `brew install faiss`.
+Linux: build FAISS 1.15.1 from source with `-DFAISS_ENABLE_C_API=ON
+-DBUILD_SHARED_LIBS=ON` and install it to `/usr/local` (the README has the
+commands); elsewhere, add `CGO_CFLAGS=-I<prefix>/include` and
+`CGO_LDFLAGS="-L<prefix>/lib -Wl,-rpath,<prefix>/lib"`. Windows is not
+supported.
+
+Built with `CGO_ENABLED=0` the application still compiles, and every call,
+`Boot` included, answers `ErrUnavailable`.
 
 ## Install
 
 ```bash
-go get github.com/hyz-is/arandu-faiss
+go get github.com/hyz-is/arandu-faiss@v0.1.0
 ```
 
-## The three lines of wiring, and where each one goes
+## The wiring, and where it goes
 
-All three are in `bootstrap/app.go`. Nothing else in the application changes,
-and `aru make:module` does not edit this file for you.
-
-The import, with the other module imports:
+All of it is in `bootstrap/app.go`.
 
 ```go
 import (
@@ -32,153 +43,82 @@ import (
 )
 ```
 
-The construction, in `Build`, after the session store exists and before
-`k.Register`:
+In `Build`, before `k.Register`, with every value from the application's typed
+configuration (the package reads no environment variable) and the
+application's own `Store`:
 
 ```go
-	faissModule, err := faiss.New(faiss.Config{}, db, sessions)
+	faissModule, err := faiss.New(faiss.Config{
+		Models: []faiss.IndexSpec{
+			{Model: "sface_2021dec", Dim: 128}, // cosine and Flat (exact) by default
+		},
+		MaxIndexes: cfg.FAISS.MaxIndexes, // 0: 64
+	}, faceIndexStore)
 	if err != nil {
 		return App{}, err
 	}
 ```
 
-And the registration, inside the `k.Register(...)` call already there:
+Inside the `k.Register(...)` call:
 
 ```go
 		faissModule,
 ```
 
-`New` returns an error rather than starting half-wired. It refuses a
-configuration that cannot work, a nil database handle and a nil session store,
-so a wiring mistake costs one restart instead of arriving as a nil dereference
-on the first request that needed it.
+Then hand `faissModule.Registry()` to the service that screens. `Boot` checks
+FAISS is linked and builds each model's index once; shutdown frees them. There
+is no migration: the package owns no table.
 
-## Then run the migrations
-
-```bash
-aru migrate
-```
-
-Not optional, and not automatic. The package owns a table, which is why its
-`arandu.mod.toml` declares `migrations = true` — that declaration is how an
-installer finds out before deploying rather than from the first request.
-
-`aru migrate` is a step in the pipeline and never a call at the start of the
-process: with N replicas, N migrations race each other.
-
-**Symptom to recognise:** `no such table`, or `relation does not exist`, from a
-route that authorized correctly. The migration has not run.
-
-## Configuration
-
-| field | required | meaning |
-| --- | --- | --- |
-| `Prefix` | no | where the routes are mounted. Defaults to `/faiss` |
-| `PageSize` | no | how many records one page answers with. Defaults to 25, refused above 200 |
-
-`faiss.Config{}` is a complete configuration. There is no tenant to pass:
-every route needs a session, and the tenant of every statement comes from
-`data.Tenant(g)`, off the Grant of whoever is signed in. Passing a value the
-request named — a path segment, a header, a subdomain read off the URL — is what
-`TestNoTenantIsReadOutOfTheRequest` fails on in the package. In an application
-the same mistake is `aru doctor`'s `tenant-from-request`; in a package nothing
-but the package's own suite looks.
-
-`PageSize` above 200 is an error from `New`, not a silent 200. A number somebody
-wrote and did not get is worse than a number somebody wrote and was told about.
-
-## Routes
-
-| method | path | name |
-| --- | --- | --- |
-| `GET` | `/faiss` | `faiss.index` |
-| `GET` | `/faiss/{id}` | `faiss.show` |
-| `POST` | `/faiss` | `faiss.store` |
-
-Every route sits behind `RequireAuth`, mounted by the package itself. A request
-with no session is sent to `/auth/login` — 303, or `HX-Redirect` for an htmx
-request — and comes back to the address it asked for after signing in. That is
-the sign-in screen the starter kit publishes; an application without one sees
-a 404 there.
-
-**Symptom to recognise:** every route of the package redirects to
-`/auth/login`. Nobody is signed in on that request: the session cookie did not
-arrive, or the session store passed to `New` is not the one the application
-signs people in with.
-
-Build URLs from the names, never by writing the path a second time. `aru
-route:list` shows them grouped by module. Under a custom `Prefix` the paths move
-and the names do not.
-
-`GET /faiss` answers `{"data": {"items": [...]}}`, and adds
-`"next_cursor"` beside `data` when a further page exists. Pass it back as
-`?cursor=`. A page shorter than `PageSize` is the last one and carries no
-cursor.
-
-`TenantID` is not in any response. That is deliberate: it names a customer's
-identifier and the response is a declared list of fields rather than the entity.
-
-## Every route refuses everybody, until you open the policy
-
-This is the state the package ships in, and it is not a bug to work around.
-`FaissPolicy` denies every action and has no branch that allows one:
-
-```
-403 Forbidden
-```
-
-is what a correctly installed, correctly migrated, correctly wired package
-answers to an administrator who is signed in, on day one.
-
-Opening an action means writing the rule that opens it, in the package's
-`policy.go`, inside the block that says so:
+## Every call takes the Grant
 
 ```go
-	// arandu:begin custom
-	if a == FaissView && (s.ID == record.ID || s.HasRole("admin")) {
-		return nil
-	}
-	// arandu:end custom
+g, err := security.Authorize(ctx, policy, actor, ScreenFace, record)
+result, err := registry.Search(ctx, g, "sface_2021dec", embedding, 10)
+err = registry.Add(ctx, g, "sface_2021dec", []int64{label}, [][]float32{embedding})
+removed, err := registry.Remove(ctx, g, "sface_2021dec", []int64{label})
+err = registry.Rebuild(ctx, g, "sface_2021dec", labels, embeddings)
+err = registry.Drop(ctx, g, "sface_2021dec")
 ```
 
-What is not written there stays closed, including every action added later.
-There are five actions — `FaissView`, `FaissList`, `FaissCreate`,
-`FaissUpdate`, `FaissDelete` — and opening one opens exactly one.
+The tenant is `data.Tenant(g)`. Never build a Grant for a tenant the request
+named; a job uses `security.SystemGrant(action, tenant)` with the tenant of the
+records it processes. Ids are `int64`, zero or more, and the application keeps
+the mapping from its template records to them.
 
-**Do not open it from the application.** There is no hook, no override and no
-config flag for the policy, and adding one would be a second place where
-authorization is decided. If the rules this application needs are not the rules
-the package ships, the change belongs in the package.
+Apply the threshold in the application, decide there, and record
+`result.Provenance` (engine version, model, factory, metric, method, size)
+with the evidence. `Provenance.Method` is `approximate` for HNSW and IVF: say
+so in the evidence.
 
-## What the answers mean
+## The Store
 
-| status | what happened |
-| --- | --- |
-| `303` to `/auth/login` | there is no session on the request |
-| `403` | the policy refused, or no rule allows the action yet |
-| `404` | no row with that id in this tenant |
-| `303` back to the page the request came from | the input was rejected; the messages and what was typed are in the flash |
-| `422` `application/problem+json` | the input was rejected and the request asked for JSON; the messages are in `errors`, keyed by field |
+Implement `Load` (answer `faiss.ErrNotStored` when absent), `Save` (return only
+when durable) and `Delete` (absent is not an error). The bytes are every vector
+of one tenant's index — biometric data: seal them before upload, keep them in a
+private bucket (R2), derive the object key server side from `Key`, encoding
+`Tenant` and `Model`, and audit every access. `faiss.NewMemoryStore()` is for
+tests only.
 
-A request that asks for JSON (an `Accept` naming `application/json`, or an XHR
-that is not htmx) gets the 403 and the 404 as problem documents too. The
-sign-in redirect is the same for every client.
+## Symptoms to recognise
 
-The package does not choose these: its handlers return what the service
-returned, and the framework's router answers it. A refusal carries no detail
-beyond the status and its standard sentence. Telling a client why a policy said
-no tells it what exists and what does not, one request at a time. The reason is
-in the log.
-
-Anything else is a 500 and the framework's error page in development. The
-package returns unexpected errors rather than swallowing them, so a route that
-answers 200 with an empty body is not something it does.
-
-## Reporting a problem
-
-Issues and pull requests go to the repository the module path names,
-`github.com/hyz-is/arandu-faiss`, which belongs to `hyz-is`. A vulnerability goes to the
-private advisory form named in that repository's `SECURITY.md`, and never into
-an issue.
-
-MIT licensed. Copyright HYZIS - SERVICOS DIGITAIS LTDA - EPP.
+- **`faiss/c_api/...: file not found` or `library 'faiss_c' not found` at
+  build.** FAISS is not installed with its C API where the directives look;
+  install it or set `CGO_CFLAGS`/`CGO_LDFLAGS`.
+- **`Library not loaded: libfaiss_c` at start.** The running machine lacks the
+  shared library, or the rpath does not reach it.
+- **`FAISS is not linked into this build`** (`ErrUnavailable`). The binary was
+  built with `CGO_ENABLED=0` or `-tags nofaiss`.
+- **`ErrNoTenant`.** The Grant is the zero Grant or a `SystemGrant` with an
+  empty tenant.
+- **`ErrReadOnly`.** A platform administrator viewing as a member tried to
+  write; searches still work.
+- **`ErrUnknownModel`.** The model id is not in `Config.Models`.
+- **`ErrDimension`.** A vector from another model, or a truncated one.
+- **`ErrSpecMismatch` on a search.** The stored index was built under another
+  model, dimension, metric or factory string; `Rebuild` it from the templates.
+- **`ErrCorrupt`.** The Store answered bytes that are not the index it saved.
+- **`ErrIDExists`.** The label is already indexed; replacing a template is
+  `Remove`, then `Add`.
+- **A save error from `Add` or `Remove`.** The Store refused; the registry
+  discarded its copy and the next call reloads what the Store holds. Retry the
+  write.

@@ -4,13 +4,103 @@
 
 # Arandu FAISS
 
-An Arandu package. It registers its own routes, owns its own table, and decides
-for itself who may reach either.
+It searches vectors with [FAISS](https://github.com/facebookresearch/faiss) and
+answers with candidates, and it decides nothing.
+
+It was built for 1:N duplicate detection of face embeddings in KUAA: a new
+selfie's SFace template (128 `float32`, compared by cosine) is searched against
+the templates already enrolled by the same tenant, and the answer is "these
+enrolled templates are the nearest, with these scores". Whether any of them is
+the same person is the application's decision, taken with its own thresholds and
+recorded as its own evidence.
+
+What it holds:
+
+- **Index** — one FAISS index of one embedding model's vectors, each under an
+  `int64` id the application chose. `Add`, `Remove`, `Search`, `Len`,
+  `Serialize` and `Deserialize`. Exact cosine search by default (`Flat`, inner
+  product over L2-normalized copies); HNSW and IVF through a factory string for
+  scale. Safe for concurrent use: searches run in parallel, writes run alone.
+- **Registry** — one index per **tenant and model**, reached only with the
+  `security.Grant` the application's policy issued: the tenant is
+  `data.Tenant(g)`, never a value from the request. Indexes are loaded lazily
+  from a `Store` the application implements, every write is saved before it
+  returns, and at most `MaxIndexes` stay in memory.
+- **Provenance** — every search answers the engine and its version, the model,
+  dimension, metric, factory string, parameters, whether the search was
+  exhaustive or approximate, and how many vectors were searched.
+- **Module** — a `foundation.Module` with no route and no table. `Boot` checks
+  FAISS is linked and builds every configured model's index once; `Health` and
+  `Close` follow.
+
+## What it is not
+
+- **Not a decision.** There is no threshold, no "match", no "duplicate", no
+  boolean anywhere in what a search answers. `tests/Unit/decision_test.go`
+  refuses those names and walks the result types for booleans.
+- **Not a store.** It keeps no file and opens no connection. A serialized index
+  is bytes handed to the application's `Store`, which seals them and puts them
+  where the application keeps files (in KUAA, a private Cloudflare R2 bucket).
+- **Not the source of truth.** The application keeps its encrypted templates;
+  an index is derived from them and can always be rebuilt from them
+  (`Registry.Rebuild`).
+- **Not a server.** Registering it adds no route, no table and no background
+  loop.
+
+## Requirements
+
+| | |
+| --- | --- |
+| Go | 1.26 or later (`go.mod` declares the minimum) |
+| cgo | `CGO_ENABLED=1` and a C compiler. The binding is this package's own, over FAISS's C API (`libfaiss_c`) |
+| FAISS | built with its C API. Developed and tested against **1.15.1** |
+| Arandu | framework 0.56 or later |
+
+Built with `CGO_ENABLED=0`, or with `-tags nofaiss`, the package still
+compiles: `Available()`, `NewIndex`, `Deserialize`, every `Registry` call and
+the module's `Boot` and `Health` answer `ErrUnavailable`. A build without FAISS
+never answers an empty list of candidates that would read as "nothing near".
+
+### Installing FAISS
+
+| OS | install | what the cgo directives expect |
+| --- | --- | --- |
+| macOS, Apple Silicon | `brew install faiss` | `/opt/homebrew/opt/faiss/{include,lib}` |
+| macOS, Intel | `brew install faiss` | `/usr/local/opt/faiss/{include,lib}` |
+| Linux | build from source with the C API, below | `/usr/local/{include,lib}` |
+| Windows | not supported: the serialization uses `open_memstream` and `fmemopen` | |
+
+Homebrew's formula builds the C API and links OpenBLAS and libomp. Most Linux
+distribution packages do not ship `libfaiss_c`, so on Linux it is built:
+
+```bash
+sudo apt-get install -y cmake g++ libopenblas-dev
+git clone --depth 1 --branch v1.15.1 https://github.com/facebookresearch/faiss.git
+cmake -S faiss -B faiss/build -DCMAKE_BUILD_TYPE=Release \
+  -DFAISS_ENABLE_GPU=OFF -DFAISS_ENABLE_PYTHON=OFF -DFAISS_ENABLE_C_API=ON \
+  -DBUILD_SHARED_LIBS=ON -DBUILD_TESTING=OFF
+cmake --build faiss/build -j"$(nproc)"
+sudo cmake --install faiss/build   # libfaiss, libfaiss_c and the c_api headers
+sudo ldconfig
+```
+
+FAISS somewhere else is named with the standard cgo variables, which add to the
+directives in `engine_cgo.go`:
+
+```bash
+export CGO_CFLAGS="-I/opt/faiss/include"
+export CGO_LDFLAGS="-L/opt/faiss/lib -Wl,-rpath,/opt/faiss/lib"
+```
+
+The binary links `libfaiss_c` dynamically, so the machine that runs it has the
+FAISS shared libraries (and OpenBLAS and the OpenMP runtime they need) too.
+FAISS parallelizes inside a search with OpenMP; `OMP_NUM_THREADS`, read by the
+OpenMP runtime and not by this package, bounds it.
 
 ## Install
 
 ```bash
-go get github.com/hyz-is/arandu-faiss
+go get github.com/hyz-is/arandu-faiss@v0.1.0
 ```
 
 ## Wire it
@@ -27,11 +117,17 @@ import (
 )
 ```
 
-The construction, in `Build`, after the session store exists and before
-`k.Register`:
+The construction, in `Build`, before `k.Register`, with every value from the
+application's typed configuration (the package reads no environment variable)
+and the application's own `Store`:
 
 ```go
-	faissModule, err := faiss.New(faiss.Config{}, db, sessions)
+	faissModule, err := faiss.New(faiss.Config{
+		Models: []faiss.IndexSpec{
+			{Model: "sface_2021dec", Dim: 128}, // cosine, exact: the defaults
+		},
+		MaxIndexes: cfg.FAISS.MaxIndexes, // 0: 64 indexes in memory
+	}, faceIndexStore) // the application's Store: seals the bytes, keeps them in R2
 	if err != nil {
 		return App{}, err
 	}
@@ -43,191 +139,156 @@ And the registration, inside the `k.Register(...)` call already there:
 		faissModule,
 ```
 
-Then, once, before the application serves:
+Then hand `faissModule.Registry()` to the service that screens faces. There is
+no migration: the package owns no table.
 
-```bash
-aru migrate
-```
+## Use it
 
-This package owns a table, which is why the migration step is not optional and
-why `arandu.mod.toml` says `migrations = true`.
-
-## Publish the views
-
-This package carries the markup of its own pages and hands it over instead of
-rendering it from the inside, because a page you cannot edit is a page that says
-the wrong thing in your product.
-
-Look at what would be written, then write it:
-
-```bash
-aru vendor:publish --tag=view
-aru vendor:publish --tag=view --apply
-```
-
-Nothing is written without `--apply`. The preview lists every file as `create`,
-`update`, `unchanged` or `conflict`, and running the command a second time
-writes nothing. A file changed outside its `arandu:begin custom` markers is
-reported as a conflict and left alone; `--force` publishes over one, and even
-then what is inside the markers is carried forward.
-
-The files land under `resources/views/modules/faiss/`, and from that point
-they are yours. Nothing of this package is compiled beside them, so no view name
-is registered twice and no rule has to decide which of two files won — the
-consequence being that a view of this package that changes later does not reach
-a project that already published it.
-
-Two steps are left to you, and they are left to you because a command that
-edited `bootstrap/app.go` behind your back is a command whose output nobody can
-explain. Compile what was written:
-
-```bash
-aru view:build
-```
-
-and import the directory it wrote into, with the other imports:
+Every call takes the `security.Grant` the application's policy issued for the
+use case, and the model id:
 
 ```go
-	_ "your/module/path/storage/framework/views/modules/faiss"
+g, err := security.Authorize(ctx, policy, actor, ScreenFace, record)
+if err != nil {
+	return err
+}
+
+// Enrol: the template the application has just encrypted and kept.
+err = registry.Add(ctx, g, "sface_2021dec", []int64{template.Label}, [][]float32{embedding})
+
+// Screen: the nearest enrolled templates of this tenant.
+result, err := registry.Search(ctx, g, "sface_2021dec", embedding, 10)
+for _, c := range result.Candidates {
+	// c.ID is a template label, c.Score its cosine similarity.
+	// The application applies its threshold, decides, and records
+	// result.Provenance with the evidence.
+}
+
+// Erasure (LGPD): gone from memory and from the Store when it returns nil.
+removed, err := registry.Remove(ctx, g, "sface_2021dec", []int64{template.Label})
 ```
 
-Without that import the views are not in the binary, and the module refuses to
-boot rather than answering the first request that reaches one of them with a
-500. The refusal names the view, the command and the import.
+A job with no request behind it uses `security.SystemGrant(action, tenant)`
+with the tenant of the records it is processing; a Grant with no tenant is
+refused with `ErrNoTenant`, and a read-only Grant (a platform administrator
+viewing as a member) searches and cannot write (`ErrReadOnly`).
+
+**Ids are the application's.** They are `int64` and zero or more (FAISS answers
+`-1` for "no result"). The application keeps the mapping from its template
+records to these labels — a per-tenant sequence column is enough — and that
+mapping is what turns a candidate back into a record. An id is stored once;
+replacing a template is `Remove`, then `Add`.
+
+**Rebuild from the templates.** `Registry.Rebuild` replaces an index with
+exactly the vectors given, and saves it before it replaces the old one. It is
+how an index is first built from existing enrolments, how it comes back after a
+model's configuration changed (a stored index is never loaded under another
+specification: `ErrSpecMismatch`), and how an IVF index is trained on every
+vector at once.
+
+### The Store
+
+```go
+type Store interface {
+	Load(ctx context.Context, key faiss.Key) ([]byte, error) // ErrNotStored when absent
+	Save(ctx context.Context, key faiss.Key, blob []byte) error
+	Delete(ctx context.Context, key faiss.Key) error
+}
+```
+
+`Key` is `{Tenant, Model}`, built by the registry from the Grant. The bytes are
+every vector of one tenant's index — biometric data — so the application seals
+them before upload and keeps them in a private bucket under an object key it
+derives server side, encoding `Tenant` and `Model` rather than writing them into
+a path as they are. `Save` returns when the bytes are durable: a registry write
+is done when `Save` returned nil, and when `Save` fails the registry discards
+its copy in memory, so it never answers from a change the Store does not hold.
+`MemoryStore` is a Store for tests and development.
+
+The serialized form is FAISS's own format inside an envelope that records the
+model, the dimension, the metric, the factory string, the vector count and the
+SHA-256 of the FAISS bytes; `Deserialize` checks all of it before and after
+FAISS reads. It is integrity, not secrecy: sealing is the application's.
 
 ## Configuration
 
 | field | required | meaning |
 | --- | --- | --- |
-| `Prefix` | no | where the routes are mounted. Defaults to `/faiss`. |
-| `PageSize` | no | how many records one page answers with. Defaults to 25, refused above 200. |
+| `Models` | yes | the embedding models: `Model` id, `Dim`, and optionally `Metric`, `Factory`, `Parameters` |
+| `Factory` | no | factory string of a model that leaves its own empty. Defaults to `Flat` |
+| `Metric` | no | metric of a model that leaves its own empty. Defaults to `cosine` |
+| `MaxIndexes` | no | how many indexes stay in memory. Defaults to 64; the least recently used one that nobody holds is closed past it |
 
-The zero `Config{}` is a valid configuration. There is no tenant to set: every
-route needs a session, and the tenant of every statement is the one on the
-Grant of whoever is signed in.
+There is no tenant to set: the tenant of every index is the one on the Grant of
+each call.
 
-`New` returns an error rather than starting half-wired, so a setting that
-cannot work fails where it is written instead of on the first request that
-needed it.
+### Metrics
 
-## Routes
-
-| method | path | name |
+| `Metric` | FAISS | `Candidate.Score` |
 | --- | --- | --- |
-| `GET` | `/faiss` | `faiss.index` |
-| `GET` | `/faiss/{id}` | `faiss.show` |
-| `POST` | `/faiss` | `faiss.store` |
+| `cosine` (default) | inner product over L2-normalized copies | cosine similarity, -1 to 1, higher is closer |
+| `inner_product` | inner product, no normalization | higher is closer |
+| `l2` | squared L2 | lower is closer |
 
-Every one of them sits behind `RequireAuth`: a visitor with no session is sent
-to `/auth/login`, and the handler of a request that has one reads who is asking
-with `ctx.User()`. Behind the guard, every route is refused until the policy is
-opened. That is the state the package ships in, and it is deliberate.
+### Factory strings and recall
 
-A handler returns the error the service returned, and the router answers it: a
-policy refusal is 403, a record that is not there is 404, and a rejected input
-goes back where it came from with the messages in the flash. A request that asks
-for JSON gets the same statuses as `application/problem+json` documents, and a
-rejected input as a 422 with the messages keyed by field. No handler maps an
-error to a status itself.
+| `Factory` | search | `Remove` | notes |
+| --- | --- | --- | --- |
+| `Flat` (default) | exhaustive, exact | in place | the right choice up to some hundreds of thousands of vectors per tenant |
+| `HNSW32` | approximate (graph) | rebuilds the index from its own vectors | `Parameters: "efSearch=128"` trades speed for recall; the default `efSearch` of 16 can miss true neighbours |
+| `IVF1024,Flat` | approximate (inverted lists) | rebuilds the index from its own vectors | trained on the first batch, so built with `Rebuild` over a large, representative set; `Parameters: "nprobe=16"` sets how many lists are searched |
 
-## Open the policy
+An approximate index may miss a true nearest neighbour, and for duplicate
+detection a missed neighbour is a missed duplicate. Measure recall against
+`Flat` on the application's own data before switching, and record
+`Provenance.Method` with every result. Compressed encodings (`PQ`, `SQ`) are
+accepted by FAISS, but `Remove` rebuilds them from lossy reconstructions; an
+application using one rebuilds from its templates after an erasure.
 
-`policy.go` denies every action and has no branch that allows one. Open what
-this package needs, one action at a time, inside the custom block:
+## Concurrency
 
-```go
-	// arandu:begin custom
-	if a == FaissView && (s.ID == record.ID || s.HasRole("admin")) {
-		return nil
-	}
-	// arandu:end custom
-```
-
-What is not written there stays closed, including every action added later.
-
-## The data path
-
-`Faiss` embeds `model.Model`, and `faissTable`, beside it in `model.go`,
-declares its table once. `aru model:build` generates `FaissQuery.go` from
-it: `Faisss(db)`, which starts a `*FaissQuery`, and `FaissCollection`.
-The file is committed and never edited by hand; regenerate it after changing
-the entity, and `aru model:build --check` fails when it is out of date.
-
-`FaissService` owns `*data.DB` and follows
-`validate -> security.Authorize -> Grant -> Model terminal`; handlers never hold
-the database or start a query. Every query starts at `Faisss(s.db)`: the
-constructor returns one mutable query, so a second chain begun from a value held
-in a variable would carry the clauses of the first.
-
-Create builds the row with `Faisss(s.db).New()` and writes `TenantID` from
-`data.Tenant(g)`. Find authorizes before reading and again against the row it
-found. List authorizes before building its scoped, allowlisted query. The table
-keeps its default `tenant_id` scope on every terminal.
-
-Terminals return `*Faiss` and `[]*Faiss`. Keep those pointers: a copy of a
-row keeps the model of the original, and the model refuses to write through it
-with `model.ErrUnwired`. `Resource` and `Collection` are explicit response
-snapshots and do not expose tenant or Model internals.
-
-The rules of the entity itself — an invariant, a derived value, a transition
-such as `Rename` guarded by `CanRename` — go in the custom block of `model.go`,
-as pure methods: no database, no network, no clock read inside, no Grant. The
-service orchestrates: it validates, authorizes, calls those rules and saves
-with the Grant.
-
-There is no CRUD Repository. Add one only for a complex query, read model,
-report, export or raw SQL contract that the generated query cannot express.
+`Index` is safe for concurrent use: searches hold a read lock and run in
+parallel, `Add`, `Remove` and `Close` hold the write lock. FAISS's C API keeps
+its last error per thread, so each call locks the goroutine to its OS thread
+until the error is read. `Registry` shares one load between concurrent callers
+of one index, writes one index at a time with its Save, and never closes an
+index under a caller. `go test -race ./...` exercises all of it.
 
 ## Layout
 
 ```
-module.go         registration, routes, handlers and migrations
-config.go         what the application passes in
-model.go          the entity, its table and its own rules, and what it may answer with
-FaissQuery.go  the query aru model:build generates from model.go
-policy.go         who may do what
-service.go        the use cases, and Model access after authorization
-views.go          the files the application takes ownership of
+module.go        registration: Name, Routes (none), Boot, Health, Close, Registry
+config.go        what the application passes in
+spec.go          IndexSpec, metrics, factory strings, limits
+index.go         Index, Candidate, Provenance
+registry.go      Registry and Result: one index per tenant and model, write-through
+store.go         Store, Key, MemoryStore
+envelope.go      the serialized form around FAISS's own bytes
+engine_cgo.go    the binding to FAISS's C API (cgo, not nofaiss)
+engine_nocgo.go  the stub that answers ErrUnavailable
+errors.go        every error, for errors.Is
 ```
-
-## What is already correct, and has to stay that way
-
-**The policy denies everything.** There is no permit-all branch to delete
-later. The Service calls `security.Authorize` before its first `Faisss(db)`
-reach, and every Model terminal requires the Grant that call produced.
-
-**Authorization precedes the Model.** The package audit checks that order in
-every exported Service method. A Model terminal enforces tenant scope; the
-preceding Policy call decides whether the action itself is allowed.
-
-**The tenant comes from `data.Tenant(g)`.** Never from the path, the body, the
-query string or a header. The value on the Grant came from the session; a value
-that arrived with the request is a value the caller chose.
-
-**Who is asking comes from the guard.** `RequireAuth` loads the session once and
-puts the subject on the request; nothing in the module loads it again.
-
-**`arandu.mod.toml` declares what the package does** — network, filesystem,
-exec, migrations — and the suite compares the declaration against what the code
-*calls*, not against what it imports: `net/http` is imported by everything with
-a route and says nothing. A package that says it makes no outbound calls and
-then opens one fails its own tests, and that is the only place the comparison
-happens. `aru doctor` audits the application it is run inside and never loads a
-dependency, so nothing audits an installed package except the package itself.
 
 ## Tests
 
 ```bash
+export GOWORK=off CGO_ENABLED=1
 go test -race ./...
+CGO_ENABLED=0 go test ./...
 ```
 
-The denial suite constructs the Service with a nil database, so even building
-`Faisss(nil)` would panic. The structural twin reads the allowed path and
-rejects any Service method that reaches the Model before `Authorize`, and any
-handler that loads the session or picks a status itself. The route tests drive
-the module with no session, with a signed-in subject and with a rejected input,
-on that same handle over no database.
+Every vector in the tests is synthetic, drawn from a seeded generator. The
+exhaustive search is held to a float64 brute force under each metric; removal,
+the serialization round trip, specification mismatch and corruption, tenant
+isolation, refused grants, write-through and erasure across registries, failed
+saves, eviction and concurrent tenants are each a test. The tests that need
+FAISS build only with cgo; the build without it has its own.
 
-## Licence
+## Licences
 
-MIT. See [LICENSE.md](LICENSE.md). Copyright HYZIS - SERVICOS DIGITAIS LTDA - EPP.
+This package: MIT. See [LICENSE.md](LICENSE.md). Copyright HYZIS - SERVICOS
+DIGITAIS LTDA - EPP.
+
+FAISS: MIT, Copyright (c) Facebook, Inc. and its affiliates (Meta Platforms). It is linked,
+not vendored; see [NOTICE](NOTICE) for what an application that distributes a
+binary linking it carries.

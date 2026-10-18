@@ -25,21 +25,24 @@ unless you ask not to be.
 
 ## What is in scope
 
-Anything that lets a caller reach data a policy did not authorize. In
-particular:
+Anything that lets a caller reach vectors of a tenant its Grant does not name,
+or keeps vectors somebody asked to erase. In particular:
 
-- a path from a handler to a Model or database handle that does not pass through
-  the Service and its Policy;
-- a route reachable without `RequireAuth`, or a handler that takes who is
-  asking from anywhere but the subject the guard put on the request;
-- a Model terminal reached before `security.Authorize`;
-- a query whose tenant scope is disabled, or a tenant taken from anywhere but
-  `data.Tenant(g)`;
-- a `Grant` that can be produced without a policy returning nil;
-- a field reaching a response that `Resource` does not list.
+- a `Registry` path whose tenant comes from anywhere but `data.Tenant(g)`, or a
+  search that answers another tenant's ids;
+- a write accepted with a Grant that carries no tenant, or with a read-only
+  Grant;
+- a `Remove` or `Drop` that returns nil while the vectors are still in memory
+  or in the Store, or an index answered from after its Save failed;
+- a serialized index loaded under another model, dimension, metric or factory
+  string, or altered bytes reaching FAISS's reader;
+- an input -- a vector, a blob, a configuration -- that crashes the process or
+  corrupts memory through the binding;
+- a result type that carries a decision.
 
 ## What is not
 
-- A vulnerability in the framework itself. Report that to the framework.
-- A policy that is too permissive in an application that opened it. What this
-  package ships denies everything; what an application opens is its own.
+- A vulnerability in FAISS itself. Report that to FAISS, and here too if this
+  package makes it reachable.
+- What an application's Store does with the bytes. Sealing them and keeping
+  them private is the application's, as the README says.
