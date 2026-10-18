@@ -52,8 +52,12 @@ func buildable(file *ast.File) bool {
 			if err != nil {
 				continue
 			}
-			// No tag set, which is what the gates run with.
-			if !expression.Eval(func(string) bool { return false }) {
+			// The two builds the gates compile: with cgo, where FAISS is
+			// linked, and without, where the stub answers. A file either of
+			// them compiles is part of what the package does.
+			withCgo := expression.Eval(func(tag string) bool { return tag == "cgo" })
+			withoutCgo := expression.Eval(func(string) bool { return false })
+			if !withCgo && !withoutCgo {
 				return false
 			}
 		}
@@ -352,5 +356,22 @@ func TestNoTenantIsReadOutOfTheRequest(t *testing.T) {
 			}
 			return true
 		})
+	}
+}
+
+// TestTheAuditReadsBothBuilds holds the reach of every rule above. The binding
+// to FAISS compiles only with cgo, and the stub only without; an audit that
+// read one of them would vouch for a build it never saw.
+func TestTheAuditReadsBothBuilds(t *testing.T) {
+	t.Parallel()
+
+	read := map[string]bool{}
+	for _, source := range auditedFiles(t) {
+		read[source.path] = true
+	}
+	for _, path := range []string{"engine_cgo.go", "engine_nocgo.go"} {
+		if !read[path] {
+			t.Errorf("the audit does not read %s", path)
+		}
 	}
 }
