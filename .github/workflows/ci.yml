@@ -8,9 +8,17 @@ on:
 permissions:
   contents: read
 
+# The binding to FAISS is cgo. The job that holds the build without it says so
+# itself.
+env:
+  CGO_ENABLED: "1"
+  GOWORK: "off"
+
 jobs:
+  # The cgo gates against FAISS as Homebrew builds it, which is the build the
+  # module is developed against and the paths engine_cgo.go names on macOS.
   check:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
         with:
@@ -24,6 +32,9 @@ jobs:
           # standard library carries fixed vulnerabilities. "stable" is the
           # version people actually run, which is what CI should test against.
           go-version: stable
+
+      - name: install FAISS
+        run: brew install faiss
 
       - name: gofmt
         # Two filters, and neither is preference. gofmt is the only tool in the
@@ -42,11 +53,14 @@ jobs:
       - name: build
         run: go build ./...
 
+      - name: build without cgo
+        run: CGO_ENABLED=0 go build ./...
+
       - name: vet
         run: go vet ./...
 
       - name: test
-        run: go test -race ./...
+        run: go test -race -count=1 ./...
 
       # A v0 release may break, but every break must tell an installer exactly
       # what to replace. Module mode also sees a deleted package or type that a
@@ -113,11 +127,76 @@ jobs:
       # Required by doc 24: a known vulnerability blocks the merge rather than
       # showing up in a report nobody reads.
       #
-      # It is outside the template markers on purpose, so it survives configure:
-      # a package cloned from here inherits the check, which is the whole reason
-      # a faiss carries CI at all.
+      # A package cloned from the template inherits this check, which is the
+      # whole reason the template carries CI at all.
       - name: govulncheck
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
 
+  # The stub: the package compiles without cgo, and its own tests hold that
+  # every operation answers ErrUnavailable. -race needs cgo, so it is absent.
+  nocgo:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - name: build, vet and test without cgo
+        run: |
+          go build ./...
+          go vet ./...
+          go test -count=1 ./...
+
+  # The cgo gates on Linux, where distribution packages do not ship FAISS's C
+  # API: FAISS is built from source with it, once per version, and installed
+  # under a prefix the standard cgo variables name -- the override the README
+  # documents for any FAISS outside /usr/local.
+  linux:
+    runs-on: ubuntu-latest
+    env:
+      FAISS_VERSION: "1.15.1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - name: install the build dependencies of FAISS
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libopenblas-dev
+
+      - name: cache FAISS
+        id: faiss-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/faiss
+          key: faiss-${{ env.FAISS_VERSION }}-capi-${{ runner.os }}-${{ runner.arch }}
+
+      - name: build FAISS with its C API
+        if: steps.faiss-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "v${FAISS_VERSION}" https://github.com/facebookresearch/faiss.git "$RUNNER_TEMP/faiss-src"
+          cmake -S "$RUNNER_TEMP/faiss-src" -B "$RUNNER_TEMP/faiss-build" \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOME/faiss" \
+            -DFAISS_ENABLE_GPU=OFF -DFAISS_ENABLE_PYTHON=OFF -DFAISS_ENABLE_C_API=ON \
+            -DBUILD_SHARED_LIBS=ON -DBUILD_TESTING=OFF
+          cmake --build "$RUNNER_TEMP/faiss-build" -j"$(nproc)"
+          cmake --install "$RUNNER_TEMP/faiss-build"
+
+      - name: build, vet and test against it
+        run: |
+          set -euo pipefail
+          lib="$HOME/faiss/lib"
+          [ -d "$lib" ] || lib="$HOME/faiss/lib64"
+          export CGO_CFLAGS="-I$HOME/faiss/include"
+          export CGO_LDFLAGS="-L$lib -Wl,-rpath,$lib"
+          go build ./...
+          go vet ./...
+          go test -race -count=1 ./...

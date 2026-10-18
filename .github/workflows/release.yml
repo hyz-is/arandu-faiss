@@ -10,9 +10,14 @@ on:
 permissions:
   contents: write
 
+# The binding to FAISS is cgo, and the archive is verified against FAISS as
+# Homebrew builds it.
+env:
+  CGO_ENABLED: "1"
+
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
 
     steps:
       - uses: actions/checkout@v7
@@ -23,13 +28,16 @@ jobs:
         with:
           go-version: stable
 
+      - name: Install FAISS
+        run: brew install faiss
+
       - name: Verify the exact tag archive
         env:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "$TAG")"
-          archive="$RUNNER_TEMP/package-faiss"
+          archive="$RUNNER_TEMP/arandu-faiss"
           mkdir -p "$archive"
           git archive "$TAG" | tar -x -C "$archive"
           cd "$archive"
@@ -37,6 +45,7 @@ jobs:
                           -not -name '*.kyse.go' -exec gofmt -l {} +)
           test -z "$unformatted" || { echo "$unformatted"; exit 1; }
           GOWORK=off go build ./...
+          CGO_ENABLED=0 GOWORK=off go build ./...
           GOWORK=off go vet ./...
           GOWORK=off go test -race -count=1 ./...
 
