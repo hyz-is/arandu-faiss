@@ -173,7 +173,7 @@ jobs:
 
       - name: cache FAISS
         id: faiss-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/faiss
           key: faiss-${{ env.FAISS_VERSION }}-capi-${{ runner.os }}-${{ runner.arch }}
